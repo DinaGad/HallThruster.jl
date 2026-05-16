@@ -1,0 +1,116 @@
+using HallThruster: HallThruster as het
+using Test
+
+include("$(het.TEST_DIR)/unit_tests/serialization_test_utils.jl")
+
+function test_grid_serialization()
+    return @testset "Serialization" begin
+        test_roundtrip(het.GridSpec, het.EvenGrid(0))
+        test_roundtrip(het.GridSpec, het.UnevenGrid(100))
+
+        dict1 = het.OrderedDict(
+            "type" => "EvenGrid",
+            "num_cells" => 100,
+        )
+        g = het.deserialize(het.GridSpec, dict1)
+        @test g.type == :EvenGrid
+        @test g.num_cells == 100
+
+        dict2 = het.OrderedDict(
+            "type" => "UnevenGrid",
+            "num_cells" => 256,
+        )
+        g = het.deserialize(het.GridSpec, dict2)
+        @test g.type == :UnevenGrid
+        @test g.num_cells == 256
+
+        test_roundtrip(het.GridSpec, dict1)
+        test_roundtrip(het.GridSpec, dict2)
+    end
+end
+
+function test_grid_invariants(spec, grid, dom)
+    return @testset "Grid invariants" begin
+        n = spec.num_cells
+        @test grid.num_cells == n + 2
+        @test length(grid.edges) == n + 1
+        @test length(grid.cell_centers) == n + 2
+        @test grid.edges[1] == dom[1]
+        @test grid.edges[end] == dom[end]
+
+
+        @test grid.cell_centers[1] == grid.edges[1] + (grid.edges[1] - grid.cell_centers[2])
+        @test grid.cell_centers[end] == grid.edges[end] + (grid.edges[end] - grid.cell_centers[end - 1])
+
+        @test all(
+            grid.cell_centers[i] == 0.5 * (grid.edges[i] + grid.edges[i - 1])
+                for i in 2:n
+        )
+    end
+end
+
+function test_even_grid()
+    return @testset "EvenGrid" begin
+        n = 151
+        spec = het.EvenGrid(n)
+        geom = het.SPT_100.geometry
+        dom = (0.0, 0.08)
+
+        grid = het.generate_grid(spec, geom, dom)
+        test_grid_invariants(spec, grid, dom)
+
+        (; dz_cell, dz_edge) = grid
+        @testset "Spacing" begin
+            @test all(dz_cell .≈ dz_cell[1])
+            @test all(dz_edge[2:(end - 1)] .≈ dz_edge[2])
+            @test dz_edge[1] == dz_edge[2]
+            @test dz_edge[end] == dz_edge[end - 1]
+        end
+    end
+end
+
+function test_uneven_grid()
+    return @testset "UnevenGrid" begin
+        n = 25
+        spec = het.UnevenGrid(n)
+        geom = het.SPT_100.geometry
+        dom = (0.0, 0.08)
+
+        grid = het.generate_grid(spec, geom, dom)
+        test_grid_invariants(spec, grid, dom)
+
+        (; edges, cell_centers, dz_cell, dz_edge) = grid
+
+        @testset "Spacing" begin
+            # Grid spacing at right side of domain should be 2x spacing at left end
+            @test isapprox(dz_cell[end], 2 * dz_cell[1], rtol = 1.0e-3)
+            @test isapprox(dz_edge[end - 1], 2 * dz_edge[2], rtol = 1.0e-3)
+
+            # Cell widths (dz_cell) should be unifom until 1.5 * channel_length
+            for (i, z) in enumerate(edges)
+                if (i == 1)
+                    continue
+                end
+                if (z >= 1.5 * geom.channel_length)
+                    break
+                end
+                @test dz_cell[i - 1] ≈ dz_cell[1]
+            end
+
+            # Distance between cell centers (dz_edge) should be uniform until 1.5 * channel_length
+            for (i, z) in enumerate(cell_centers)
+                if (i == 1)
+                    continue
+                end
+                if (z >= 1.5 * geom.channel_length - 2 * dz_cell[1])
+                    break
+                end
+                @test isapprox(dz_edge[i], dz_edge[2], rtol = 1.0e-3)
+            end
+        end
+    end
+end
+
+test_grid_serialization()
+test_even_grid()
+test_uneven_grid()

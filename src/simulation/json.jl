@@ -1,175 +1,175 @@
-function get_key(json_content, key, default)
-    if haskey(json_content, key)
-        return json_content[key]
+@public write_to_json, run_simulation
+
+"""
+    $(TYPEDSIGNATURES)
+Run a simulation from a JSON input file.
+If `postprocess` is set in the JSON file and `postprocess.output_file` is non-empty, output will be written
+to `postprocess.output_file`.
+If `restart` is a JSON file, this function will also try to restart the simulation from that file.
+Returns a `Solution` object.
+"""
+function run_simulation(json_file::String; restart::String = "")
+    json_file = if !ispath(json_file)
+        joinpath(@__DIR__, json_file)
     else
-        return default
+        json_file
     end
+
+    if (splitext(json_file)[2] != ".json")
+        throw(ArgumentError("$json_file is not a valid JSON file"))
+    end
+
+    obj = JSON.parsefile(json_file)
+
+    # Read config and sim params from file
+    input = get(obj, "input", obj)
+    cfg = deserialize(Config, input["config"])
+    sim = deserialize(SimParams, input["simulation"])
+
+    postprocess::Union{Postprocess, Nothing} = nothing
+    if haskey(input, "postprocess") && haskey(input["postprocess"], "output_file") &&
+            !isempty(input["postprocess"]["output_file"])
+        postprocess = deserialize(Postprocess, input["postprocess"])
+    end
+
+    sol = run_simulation(cfg, sim; postprocess, include_dirs = dirname(json_file), restart)
+
+    if postprocess !== nothing
+        (; average_start_time, save_time_resolved) = postprocess
+        write_to_json(postprocess.output_file, sol; average_start_time, save_time_resolved)
+    end
+
+    return sol
 end
 
-function config_from_json(json_content::JSON3.Object) 
-    pressure_z0 = NaN
-    pressure_dz = NaN
-    pressure_pstar = NaN
-    pressure_alpha = NaN
-    apply_thrust_divergence_correction = true
+"""
+    $(TYPEDSIGNATURES)
+Convert one frame of a `Solution` to an `OrderedDict`
+"""
+function frame_dict(sol::Solution, frame::Integer)
+    f = sol.frames[frame]
+    d = OrderedDict{String, Any}()
+    d["thrust"] = thrust(sol, frame)
+    d["discharge_current"] = discharge_current(sol, frame)
+    d["ion_current"] = ion_current(sol, frame)
+    d["mass_eff"] = mass_eff(sol, frame)
+    d["voltage_eff"] = voltage_eff(sol, frame)
+    d["current_eff"] = current_eff(sol, frame)
+    d["divergence_eff"] = divergence_eff(sol, frame)
+    d["anode_eff"] = anode_eff(sol, frame)
+    d["t"] = sol.t[frame]
+    d["z"] = sol.grid
+    d["B"] = f.B
+    d["ne"] = f.ne
+    d["ue"] = f.ue
+    d["potential"] = f.potential
+    d["E"] = f.E
+    d["Tev"] = f.Tev
+    d["pe"] = f.pe
+    d["grad_pe"] = f.grad_pe
+    d["nu_en"] = f.nu_en
+    d["nu_ei"] = f.nu_ei
+    d["nu_anom"] = f.nu_an
+    d["nu_class"] = f.nu_class
+    d["mobility"] = f.mobility
+    d["channel_area"] = f.channel_area
 
-    (;
-        # Design
-        channel_length, inner_radius, outer_radius,
-        magnetic_field_file, magnetically_shielded,
-        propellant, wall_material,
-        anode_potential, cathode_potential,
-        anode_mass_flow_rate,
-        # Simulation
-        anom_model, cathode_location_m, max_charge,
-        num_cells, dt_s, duration_s, num_save,
-        flux_function, limiter, reconstruct,
-        ion_wall_losses, electron_ion_collisions,
-        # Parameters
-        sheath_loss_coefficient,
-        ion_temp_K, neutral_temp_K, neutral_velocity_m_s,
-        cathode_electron_temp_eV, inner_outer_transition_length_m,
-        background_pressure_Torr, background_temperature_K,
-    ) = json_content
-
-    # Thruster name
-    thruster_name = get_key(json_content, :thruster_name, "Unnamed Thruster")
-
-    # Anom coefficients
-    anom_model_coeffs = get_key(json_content, :anom_model_coeffs, [0.00625, 0.0625])
-
-    # Whether inbuilt divergence model is used to correct thrust
-    apply_thrust_divergence_correction = get_key(json_content, :apply_thrust_divergence_correction, true)
-
-    # Whether we solve a quasi-1D plume expansion
-    solve_plume = get_key(json_content, :solve_plume, true)
-
-    # Electron loss coeffient in the plume
-    electron_plume_loss_scale = get_key(json_content, :plume_loss_coefficient, 1.0)
-
-    # neutral ingestion multiplier
-    neutral_ingestion_multiplier::Float64 = get_key(json_content, :neutral_ingestion_multiplier, 1.0)
-
-    # Optional parameters for pressure-dependent models
-    if  anom_model == "ShiftedTwoZone" || anom_model == "ShiftedTwoZoneBohm" ||
-        anom_model == "ShiftedMultiBohm" || anom_model == "ShiftedGaussianBohm"
-        (;pressure_z0, pressure_dz, pressure_pstar, pressure_alpha) = json_content
+    if length(sol.config.propellants) == 1
+        symbol = sol.config.propellants[1].gas.short_name
+        d["nn"] = f.neutrals[symbol].n
+        d["ni"] = [ion.n for ion in f.ions[symbol]]
+        d["ui"] = [ion.u for ion in f.ions[symbol]]
+        d["niui"] = [ion.nu for ion in f.ions[symbol]]
     end
 
-    geometry = Geometry1D(;channel_length, outer_radius, inner_radius)
+    d["neutrals"] = OrderedDict(
+        symbol => OrderedDict(
+                "n" => neutral.n,
+                "u" => neutral.u,
+                "nu" => neutral.nu,
+            ) for (symbol, neutral) in pairs(f.neutrals)
+    )
 
-    bfield_func = try
-        bfield_data = readdlm(magnetic_field_file, ',')
-        HallThruster.LinearInterpolation(bfield_data[:, 1], bfield_data[:, 2])
-    catch e
-        if thruster_name == "SPT-100"
-            @warn "Could not find provided magnetic field file. Using default SPT-100 field."
-            HallThruster.B_field_SPT_100 $ (0.016, channel_length)
-        else
-            error(e)
+    d["ions"] = OrderedDict(
+        symbol => [
+                OrderedDict(
+                    "n" => ion.n,
+                    "u" => ion.u,
+                    "nu" => ion.nu,
+                    "Z" => ion.Z,
+                )
+                for ion in ions
+            ]
+            for (symbol, ions) in pairs(f.ions)
+    )
+
+    return d
+end
+
+"""
+    $(TYPEDSIGNATURES)
+Convert `sol` to an `OrderedDict`, containing both the inputs used to run the simulation
+and any requested outputs.
+This function is used to convert a `Solution` to a format suitable for writing to an output file.
+"""
+function serialize_sol(
+        sol::Solution; average_start_time::AbstractFloat = -1, save_time_resolved::Bool = true,
+    )
+    output = OrderedDict{String, Any}()
+    output["retcode"] = string(sol.retcode)
+    output["error"] = sol.error
+
+    if average_start_time >= 0
+        first_frame = findfirst(>=(average_start_time), sol.t)
+        if first_frame === nothing
+            first_frame = 1
         end
+        avg = time_average(sol, first_frame)
+        output["average"] = frame_dict(avg, 1)
     end
 
-    thruster = HallThruster.Thruster(;
-        name = thruster_name,
-        geometry = geometry,
-        magnetic_field = bfield_func,
-        shielded = magnetically_shielded
-    )
-
-    # assign anomalous transport model
-    anom_model = if anom_model == "NoAnom"
-        NoAnom()
-    elseif anom_model == "Bohm"
-        Bohm(anom_model_coeffs[1])
-    elseif anom_model == "TwoZoneBohm"
-        TwoZoneBohm((anom_model_coeffs[1], anom_model_coeffs[2]))
-    elseif anom_model == "MultiLogBohm"
-        MultiLogBohm(anom_model_coeffs)
-    elseif anom_model == "ShiftedTwoZone" || anom_model == "ShiftedTwoZoneBohm"
-        coeff_tuple = (anom_model_coeffs[1], anom_model_coeffs[2])
-        ShiftedTwoZoneBohm(coeff_tuple, pressure_z0, pressure_dz, pressure_pstar, pressure_alpha)
-    elseif anom_model == "ShiftedMultiBohm"
-        N = length(anom_model_coeffs)
-        ShiftedMultiBohm(
-            anom_model_coeffs[1:N÷2], anom_model_coeffs[N÷2 + 1], pressure_z0, pressure_dz, pressure_pstar, pressure_alpha
-        )
-    elseif anom_model == "ShiftedGaussianBohm"
-        ShiftedGaussianBohm(
-            anom_model_coeffs[1], anom_model_coeffs[2], anom_model_coeffs[3], anom_model_coeffs[4],
-            pressure_z0, pressure_dz, pressure_pstar, pressure_alpha
-        )
+    if save_time_resolved
+        output["frames"] = [frame_dict(sol, i) for i in eachindex(sol.frames)]
     end
 
-    config = HallThruster.Config(;
-        thruster,
-        propellant = eval(Symbol(propellant)),
-        anom_model,
-        domain = (0.0, cathode_location_m),
-        discharge_voltage = anode_potential - cathode_potential,
-        anode_mass_flow_rate = anode_mass_flow_rate,
-        cathode_potential = cathode_potential,
-        ncharge = max_charge,
-        wall_loss_model = WallSheath(eval(Symbol(wall_material)), Float64(sheath_loss_coefficient)),
-        ion_wall_losses = ion_wall_losses,
-        cathode_Te = cathode_electron_temp_eV,
-        LANDMARK = false,
-        ion_temperature = ion_temp_K,
-        neutral_temperature = neutral_temp_K,
-        neutral_velocity = neutral_velocity_m_s,
-        electron_ion_collisions = electron_ion_collisions,
-        min_electron_temperature = cathode_electron_temp_eV,
-        transition_length = inner_outer_transition_length_m,
-        scheme = HyperbolicScheme(;
-            flux_function = eval(Symbol(flux_function)), limiter = eval(Symbol(limiter)), reconstruct
+    return OrderedDict(
+        "input" => OrderedDict(
+            "config" => serialize(sol.config),
+            "simulation" => serialize(sol.simulation),
+            "postprocess" => serialize(sol.postprocess),
         ),
-        background_pressure = background_pressure_Torr * u"Torr",
-        background_neutral_temperature = background_temperature_K * u"K",
-        neutral_ingestion_multiplier,
-        solve_plume,
-        apply_thrust_divergence_correction,
-        electron_plume_loss_scale
+        "output" => output,
+    )
+end
+
+"""
+    $(TYPEDSIGNATURES)
+Write `sol` to `file`, if `file` is a JSON file. Any NaN or Inf values in the solution will be replaced with zero.
+
+## Mandatory arguments
+- `file`: the file to which we write the solution
+- `sol`: the `Solution` object to be written
+
+## Optional keyword args
+- `average_start_time` = -1: the time at which averaging begins. If < 0, no averaged output is written.
+- `save_time_resolved` = true: Whether to save all frames of the simulation. If `false`, no time-resolved output is written.
+"""
+function write_to_json(
+        file::String, sol::Solution;
+        average_start_time::AbstractFloat = -1.0, save_time_resolved::Bool = true,
     )
 
-    return config
-end
-
-function config_from_json(json_path::String; is_path = true, kwargs...) 
-    if is_path
-        json_content = JSON3.read(read(json_path, String))
-    else
-        json_content = JSON3.read(json_path)
+    ext = splitext(file)[2]
+    if lowercase(ext) != ".json"
+        throw(ArgumentError("$(file) is not a JSON file."))
     end
 
-    return config_from_json(json_content)
-end
+    output = serialize_sol(sol; average_start_time, save_time_resolved)
 
-
-function run_simulation(json_content::JSON3.Object; verbose = true)
-    
-    adaptive = get_key(json_content, :adaptive, true)
-    num_save = get_key(json_content, :num_save, 100)
-    num_cells = get_key(json_content, :num_cells, 200)
-    duration_s = get_key(json_content, :duration_s, 1e-3)
-    dt_s = get_key(json_content, :dt_s, 1e-8)
-
-    config = config_from_json(json_content)
-
-    solution = run_simulation(
-        config; grid = EvenGrid(num_cells), nsave = num_save,
-        duration = duration_s, dt = dt_s, verbose = verbose, adaptive
-    )
-
-    return solution
-end
-
-function run_simulation(json_path::String; is_path = true, kwargs...)
-
-    if is_path
-        json_content = JSON3.read(read(json_path, String))
-    else
-        json_content = JSON3.read(json_path)
+    # Write output dictionary to file, replacing NaN and Inf values with zeros for JSON compliance.
+    open(file, "w") do f
+        JSON.write_json(f, output, replace_inf = true, replace_nan = true)
     end
 
-    run_simulation(json_content; kwargs...)
+    return nothing
 end
